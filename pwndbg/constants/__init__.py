@@ -1,5 +1,18 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import pwndbg.arch
-from . import arm, aarch64, thumb, mips, amd64, i386
+
+from . import aarch64
+from . import amd64
+from . import arm
+from . import i386
+from . import mips
+from . import thumb
 
 arches = {
     'arm': arm,

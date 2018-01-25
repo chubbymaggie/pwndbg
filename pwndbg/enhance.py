@@ -8,16 +8,26 @@ Currently prints out code, integers, or strings, in a best-effort manner
 dependent on page permissions, the contents of the data, and any
 supplemental information sources (e.g. active IDA Pro connection).
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import string
 
 import gdb
+
 import pwndbg.arch
+import pwndbg.color as color
+import pwndbg.color.enhance as E
+import pwndbg.config
 import pwndbg.disasm
 import pwndbg.memoize
 import pwndbg.memory
 import pwndbg.strings
 import pwndbg.symbol
 import pwndbg.typeinfo
+from pwndbg.color.syntax_highlight import syntax_highlight
 
 bad_instrs = [
 '.byte',
@@ -30,6 +40,18 @@ bad_instrs = [
 
 def good_instr(i):
     return not any(bad in i for bad in bad_instrs)
+
+def int_str(value):
+    retval = '%#x' % int(value & pwndbg.arch.ptrmask)
+
+    # Try to unpack the value as a string
+    packed = pwndbg.arch.pack(int(value))
+    if all(c in string.printable.encode('utf-8') for c in packed):
+        if len(retval) > 4:
+            retval = '%s (%r)' % (retval, str(packed.decode('ascii', 'ignore')))
+
+    return retval
+
 
 # @pwndbg.memoize.reset_on_stop
 def enhance(value, code = True):
@@ -59,15 +81,7 @@ def enhance(value, code = True):
         can_read = False
 
     if not can_read:
-        retval = '%#x' % int(value)
-
-        # Try to unpack the value as a string
-        packed = pwndbg.arch.pack(int(value))
-        if all(c in string.printable.encode('utf-8') for c in packed):
-            if len(retval) > 4:
-                retval = '%s (%r)' % (retval, str(packed.decode('ascii', 'ignore')))
-
-        return retval
+        return E.integer(int_str(value))
 
     # It's mapped memory, or we can at least read it.
     # Try to find out if it's a string.
@@ -77,7 +91,7 @@ def enhance(value, code = True):
 
     # For the purpose of following pointers, don't display
     # anything on the stack or heap as 'code'
-    if 'stack' in page.objfile or 'heap' in page.objfile:
+    if '[stack' in page.objfile or '[heap' in page.objfile:
         rwx = exe = False
 
     # If IDA doesn't think it's in a function, don't display it as code.
@@ -88,18 +102,20 @@ def enhance(value, code = True):
         instr = pwndbg.disasm.one(value)
         if instr:
             instr = "%-6s %s" % (instr.mnemonic, instr.op_str)
+            if pwndbg.config.syntax_highlight:
+                instr = syntax_highlight(instr)
 
     szval = pwndbg.strings.get(value) or None
     szval0 = szval
     if szval:
-        szval = repr(szval)
+        szval = E.string(repr(szval))
 
     intval  = int(pwndbg.memory.poi(pwndbg.typeinfo.pvoid, value))
     intval0 = intval
     if 0 <= intval < 10:
-        intval = str(intval)
+        intval = E.integer(str(intval))
     else:
-        intval = '%#x' % int(intval & pwndbg.arch.ptrmask)
+        intval = E.integer('%#x' % int(intval & pwndbg.arch.ptrmask))
 
     retval = []
 
@@ -136,15 +152,14 @@ def enhance(value, code = True):
 
     # And then integer
     else:
-        retval = [intval]
-
+        return E.integer(int_str(intval0))
 
     retval = tuple(filter(lambda x: x is not None, retval))
 
     if len(retval) == 0:
-        return "???"
+        return E.unknown("???")
 
     if len(retval) == 1:
         return retval[0]
 
-    return retval[0] + ' /* {} */'.format('; '.join(retval[1:]))
+    return retval[0] + E.comment(color.strip(' /* {} */'.format('; '.join(retval[1:]))))

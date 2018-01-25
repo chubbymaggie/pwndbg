@@ -7,46 +7,66 @@ all of the address spaces and permissions of an ELF file in memory.
 This is necessary for when access to /proc is restricted, or when
 working on a BSD system which simply does not have /proc.
 """
+from __future__ import absolute_import
+from __future__ import division
 from __future__ import print_function
+from __future__ import unicode_literals
 
-import os
-import re
-import subprocess
-import tempfile
+import ctypes
+import sys
 
 import gdb
+from six.moves import reload_module
+
+import pwndbg.abi
+import pwndbg.arch
 import pwndbg.auxv
+import pwndbg.elftypes
 import pwndbg.events
 import pwndbg.info
 import pwndbg.memoize
 import pwndbg.memory
 import pwndbg.proc
 import pwndbg.stack
-import pwndbg.typeinfo
 
 # ELF constants
 PF_X, PF_W, PF_R = 1,2,4
 ET_EXEC, ET_DYN  = 2,3
 
-# In order for this file to work, we need to have symbols loaded
-# in GDB for various ELF header types.
-#
-# We can simply create an object file and load its symbols (and types!)
-# into our address space.  This should not pollute any actual symbols
-# since we don't declare any functions, and load the object file at
-# address zero.
-tempdir = tempfile.gettempdir()
-gef_elf = os.path.join(tempdir, 'pwndbg-elf')
-with open(gef_elf + '.c', 'w+') as f:
-    f.write('''#include <elf.h>
-Elf32_Ehdr a;
-Elf64_Ehdr b;
-Elf32_Phdr e;
-Elf64_Phdr f;
-''')
-    f.flush()
 
-subprocess.check_output('gcc -c -g %s.c -o %s.o' % (gef_elf, gef_elf), shell=True)
+module = sys.modules[__name__]
+
+
+@pwndbg.events.start
+@pwndbg.events.new_objfile
+def update():
+    reload_module(pwndbg.elftypes)
+
+    if pwndbg.arch.ptrsize == 4:
+        Ehdr = pwndbg.elftypes.Elf32_Ehdr
+        Phdr = pwndbg.elftypes.Elf32_Phdr
+    else:
+        Ehdr = pwndbg.elftypes.Elf64_Ehdr
+        Phdr = pwndbg.elftypes.Elf64_Phdr
+
+    module.__dict__.update(locals())
+
+update()
+
+
+def read(typ, address, blob=None):
+    size = ctypes.sizeof(typ)
+
+    if not blob:
+        data = pwndbg.memory.read(address, size)
+    else:
+        data = blob[address:address+size]
+
+    obj = typ.from_buffer_copy(data)
+    obj.address = address
+    obj.type = typ
+    return obj
+
 
 @pwndbg.proc.OnlyWhenRunning
 @pwndbg.memoize.reset_on_start
@@ -55,7 +75,10 @@ def exe():
     Return a loaded ELF header object pointing to the Ehdr of the
     main executable.
     """
-    return load(entry())
+    e = entry()
+    if e:
+        return load(e)
+
 
 @pwndbg.proc.OnlyWhenRunning
 @pwndbg.memoize.reset_on_start
@@ -83,7 +106,7 @@ def entry():
     # Try common names
     for name in ['_start', 'start', '__start', 'main']:
         try:
-            return int(gdb.parse_and_eval(name))
+            return pwndbg.symbol.address(name)
         except gdb.error:
             pass
 
@@ -94,61 +117,77 @@ def entry():
 def load(pointer):
     return get_ehdr(pointer)[1]
 
-def get_ehdr(pointer):
-    """
-    Given a pointer into an ELF module, return a list of all loaded
-    sections in the ELF.
+ehdr_type_loaded = 0
 
+
+@pwndbg.memoize.reset_on_start
+def reset_ehdr_type_loaded():
+    global ehdr_type_loaded
+    ehdr_type_loaded = 0
+
+
+@pwndbg.abi.LinuxOnly()
+def find_elf_magic(pointer, max_pages=1024, search_down=False, ret_addr_anyway=False):
+    """Search the nearest page which contains the ELF headers
+    by comparing the ELF magic with first 4 bytes.
+
+    Parameter:
+        search_down: change the search direction
+        to search over the lower address.
+        That is, decreasing the page pointer instead of increasing.
+            (default: False)
     Returns:
-        A tuple containing (ei_class, gdb.Value).
-        The gdb.Value object has type of either Elf32_Ehdr or Elf64_Ehdr.
-
-    Example:
-
-        >>> pwndbg.elf.load(gdb.parse_and_eval('$pc'))
-        [Page('400000-4ef000 r-xp 0'),
-         Page('6ef000-6f0000 r--p ef000'),
-         Page('6f0000-6ff000 rw-p f0000')]
-        >>> pwndbg.elf.load(0x7ffff77a2000)
-        [Page('7ffff75e7000-7ffff77a2000 r-xp 0x1bb000 0'),
-         Page('7ffff77a2000-7ffff79a2000 ---p 0x200000 1bb000'),
-         Page('7ffff79a2000-7ffff79a6000 r--p 0x4000 1bb000'),
-         Page('7ffff79a6000-7ffff79ad000 rw-p 0x7000 1bf000')]
+        An integer address of ELF page base
+        None if not found within the page limit
     """
-    with pwndbg.events.Pause():
-        gdb.execute('add-symbol-file %s.o 0' % gef_elf, from_tty=False, to_string=True)
+    addr = pwndbg.memory.page_align(pointer)
+    step = pwndbg.memory.PAGE_SIZE
+    if search_down:
+        step = -step
 
-    Elf32_Ehdr = pwndbg.typeinfo.load('Elf32_Ehdr')
-    Elf64_Ehdr = pwndbg.typeinfo.load('Elf64_Ehdr')
+    max_addr = pwndbg.arch.ptrmask
 
+    for i in range(max_pages):
+        # Make sure address within valid range or gdb will raise Overflow exception
+        if addr < 0 or addr > max_addr:
+            return None
+
+        try:
+            data = pwndbg.memory.read(addr, 4)
+        except gdb.MemoryError:
+            return addr if ret_addr_anyway else None
+
+        # Return the address if found ELF header
+        if data == b'\x7FELF':
+            return addr
+
+        addr += step
+
+    return addr if ret_addr_anyway else None
+
+
+def get_ehdr(pointer):
+    """Returns an ehdr object for the ELF pointer points into.
+    """
     # Align down to a page boundary, and scan until we find
     # the ELF header.
     base = pwndbg.memory.page_align(pointer)
 
-    try:
-        data = pwndbg.memory.read(base, 4)
-
-        # Do not search more than 4MB of memory
-        for i in range(1024):
-            if data == b'\x7FELF':
-                break
-
-            base -= pwndbg.memory.PAGE_SIZE
-            data = pwndbg.memory.read(base, 4)
-
-        else:
+    # For non linux ABI, the ELF header may not be found in memory.
+    # This will hang the gdb when using the remote gdbserver to scan 1024 pages
+    base = find_elf_magic(pointer, search_down=True)
+    if base is None:
+        if pwndbg.abi.linux:
             print("ERROR: Could not find ELF base!")
-            return None, None
-    except gdb.MemoryError:
         return None, None
 
     # Determine whether it's 32- or 64-bit
     ei_class = pwndbg.memory.byte(base+4)
 
     # Find out where the section headers start
-    EhdrType = { 1: Elf32_Ehdr, 2: Elf64_Ehdr }[ei_class]
-    Elfhdr   = pwndbg.memory.poi(EhdrType, base)
+    Elfhdr   = read(Ehdr, base)
     return ei_class, Elfhdr
+
 
 def get_phdrs(pointer):
     """
@@ -161,33 +200,31 @@ def get_phdrs(pointer):
     if Elfhdr is None:
         return (0, 0, None)
 
-    Elf32_Phdr = pwndbg.typeinfo.load('Elf32_Phdr')
-    Elf64_Phdr = pwndbg.typeinfo.load('Elf64_Phdr')
-    PhdrType   = { 1: Elf32_Phdr, 2: Elf64_Phdr }[ei_class]
+    phnum     = Elfhdr.e_phnum
+    phoff     = Elfhdr.e_phoff
+    phentsize = Elfhdr.e_phentsize
 
-    phnum     = int(Elfhdr['e_phnum'])
-    phoff     = int(Elfhdr['e_phoff'])
-    phentsize = int(Elfhdr['e_phentsize'])
-
-    x = (phnum, phentsize, pwndbg.memory.poi(PhdrType, int(Elfhdr.address) + phoff))
+    x = (phnum, phentsize, read(Phdr, Elfhdr.address + phoff))
     return x
+
 
 def iter_phdrs(ehdr):
     if not ehdr:
         raise StopIteration
 
-    phnum, phentsize, phdr = get_phdrs(int(ehdr.address))
+    phnum, phentsize, phdr = get_phdrs(ehdr.address)
 
     if not phdr:
         raise StopIteration
 
-    first_phdr = int(phdr.address)
+    first_phdr = phdr.address
     PhdrType   = phdr.type
 
     for i in range(0, phnum):
         p_phdr = int(first_phdr + (i*phentsize))
-        p_phdr = pwndbg.memory.poi(PhdrType, p_phdr)
+        p_phdr = read(PhdrType, p_phdr)
         yield p_phdr
+
 
 def map(pointer, objfile=''):
     """
@@ -199,7 +236,7 @@ def map(pointer, objfile=''):
 
     Example:
 
-        >>> pwndbg.elf.load(gdb.parse_and_eval('$pc'))
+        >>> pwndbg.elf.load(pwndbg.regs.pc)
         [Page('400000-4ef000 r-xp 0'),
          Page('6ef000-6f0000 r--p ef000'),
          Page('6f0000-6ff000 rw-p f0000')]
@@ -212,7 +249,7 @@ def map(pointer, objfile=''):
     ei_class, ehdr         = get_ehdr(pointer)
     return map_inner(ei_class, ehdr, objfile)
 
-@pwndbg.memoize.reset_on_objfile
+
 def map_inner(ei_class, ehdr, objfile):
     if not ehdr:
         return []
@@ -228,15 +265,15 @@ def map_inner(ei_class, ehdr, objfile):
     # override their small subset of address space.
     pages = []
     for phdr in iter_phdrs(ehdr):
-        memsz   = int(phdr['p_memsz'])
+        memsz   = int(phdr.p_memsz)
 
         if not memsz:
             continue
 
-        vaddr   = int(phdr['p_vaddr'])
-        offset  = int(phdr['p_offset'])
-        flags   = int(phdr['p_flags'])
-        ptype   = int(phdr['p_type'])
+        vaddr   = int(phdr.p_vaddr)
+        offset  = int(phdr.p_offset)
+        flags   = int(phdr.p_flags)
+        ptype   = int(phdr.p_type)
 
         memsz += pwndbg.memory.page_offset(vaddr)
         memsz  = pwndbg.memory.page_size_align(memsz)
@@ -259,7 +296,7 @@ def map_inner(ei_class, ehdr, objfile):
 
     # Adjust against the base address that we discovered
     # for binaries that are relocatable / type DYN.
-    if ET_DYN == int(ehdr['e_type']):
+    if ET_DYN == int(ehdr.e_type):
         for page in pages:
             page.vaddr += base
 

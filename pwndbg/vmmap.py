@@ -7,15 +7,26 @@ address ranges with various ELF files and permissions.
 The reason that we need robustness is that not every operating
 system has /proc/$$/maps, which backs 'info proc mapping'.
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
+import bisect
+import os
 import sys
 
 import gdb
+
+import pwndbg.abi
 import pwndbg.compat
+import pwndbg.elf
 import pwndbg.events
 import pwndbg.file
 import pwndbg.memoize
 import pwndbg.memory
 import pwndbg.proc
+import pwndbg.qemu
 import pwndbg.regs
 import pwndbg.remote
 import pwndbg.stack
@@ -25,6 +36,11 @@ import pwndbg.typeinfo
 # by analyzing the stack or register context.
 explored_pages = []
 
+# List of custom pages that can be managed manually by vmmap_* commands family
+custom_pages = []
+
+@pwndbg.events.new_objfile
+@pwndbg.memoize.reset_on_stop
 def get():
     pages = []
     pages.extend(proc_pid_maps())
@@ -38,13 +54,17 @@ def get():
         pages.extend(pwndbg.stack.stacks.values())
 
     pages.extend(explored_pages)
+    pages.extend(custom_pages)
     pages.sort()
-    return pages
+    return tuple(pages)
 
 @pwndbg.memoize.reset_on_stop
 def find(address):
     if address is None or address < pwndbg.memory.MMAP_MIN_ADDR:
         return None
+
+    if address:
+        address = int(address)
 
     for page in get():
         if address in page:
@@ -52,6 +72,7 @@ def find(address):
 
     return explore(address)
 
+@pwndbg.abi.LinuxOnly()
 def explore(address_maybe):
     """
     Given a potential address, check to see what permissions it has.
@@ -66,6 +87,9 @@ def explore(address_maybe):
 
         Also assumes the entire contiguous section has the same permission.
     """
+    if proc_pid_maps():
+        return None
+
     address_maybe = pwndbg.memory.page_align(address_maybe)
 
     flags = 4 if pwndbg.memory.peek(address_maybe) else 0
@@ -95,6 +119,26 @@ def clear_explored_pages():
     while explored_pages:
         explored_pages.pop()
 
+
+def add_custom_page(page):
+    bisect.insort(custom_pages, page)
+
+    # Reset all the cache
+    # We can not reset get() only, since the result may be used by others.
+    # TODO: avoid flush all caches
+    pwndbg.memoize.reset()
+
+
+def clear_custom_page():
+    while custom_pages:
+        custom_pages.pop()
+
+    # Reset all the cache
+    # We can not reset get() only, since the result may be used by others.
+    # TODO: avoid flush all caches
+    pwndbg.memoize.reset()
+
+
 @pwndbg.memoize.reset_on_stop
 def proc_pid_maps():
     """
@@ -103,6 +147,9 @@ def proc_pid_maps():
     Returns:
         A list of pwndbg.memory.Page objects.
     """
+
+    if pwndbg.qemu.is_qemu_usermode():
+        return tuple()
 
     example_proc_pid_maps = """
     7f95266fa000-7f95268b5000 r-xp 00000000 08:01 418404                     /lib/x86_64-linux-gnu/libc-2.19.so
@@ -168,8 +215,7 @@ def proc_pid_maps():
 
     return tuple(pages)
 
-
-@pwndbg.memoize.reset_on_objfile
+@pwndbg.memoize.reset_on_stop
 def info_sharedlibrary():
     """
     Parses the output of `info sharedlibrary`.
@@ -215,7 +261,7 @@ def info_sharedlibrary():
 
     return tuple(sorted(pages))
 
-@pwndbg.memoize.reset_on_objfile
+@pwndbg.memoize.reset_on_stop
 def info_files():
 
     example_info_files_linues = """
@@ -294,25 +340,33 @@ def info_auxv(skip_exe=False):
     pages    = []
     exe_name = auxv.AT_EXECFN or 'main.exe'
     entry    = auxv.AT_ENTRY
-    vdso     = auxv.AT_SYSINFO_EHDR
+    base     = auxv.AT_BASE
+    vdso     = auxv.AT_SYSINFO_EHDR or auxv.AT_SYSINFO
     phdr     = auxv.AT_PHDR
 
     if not skip_exe and (entry or phdr):
         pages.extend(pwndbg.elf.map(entry or phdr, exe_name))
 
+    if base:
+        pages.extend(pwndbg.elf.map(base, '[linker]'))
+
     if vdso:
-        pages.append(find_boundaries(vdso, '[vdso]'))
+        pages.extend(pwndbg.elf.map(vdso, '[vdso]'))
 
     return tuple(sorted(pages))
 
 
-def find_boundaries(addr, name=''):
+def find_boundaries(addr, name='', min=0):
     """
     Given a single address, find all contiguous pages
     which are mapped.
     """
     start = pwndbg.memory.find_lower_boundary(addr)
     end   = pwndbg.memory.find_upper_boundary(addr)
+
+    if start < min:
+        start = min
+
     return pwndbg.memory.Page(start, end-start, 4, 0, name)
 
 aslr = False
@@ -328,19 +382,44 @@ def check_aslr():
     system_aslr = True
     data        = b''
 
+    # QEMU does not support this concept.
+    if pwndbg.qemu.is_qemu_usermode():
+        return vmmap.aslr
+
+    # Systemwide ASLR is disabled
     try:
         data = pwndbg.file.get('/proc/sys/kernel/randomize_va_space')
+        if b'0' in data:
+            vmmap.aslr = False
+            return vmmap.aslr
     except Exception as e:
         print("Could not check ASLR: Couldn't get randomize_va_space")
         pass
 
-    # Systemwide ASLR is disabled
-    if b'0' in data:
-        return
+    # Check the personality of the process
+    if pwndbg.proc.alive:
+        try:
+            data = pwndbg.file.get('/proc/%i/personality' % pwndbg.proc.pid)
+            personality = int(data, 16)
+            if personality & 0x40000 == 0:
+                vmmap.aslr = True
+            return vmmap.aslr
+        except:
+            print("Could not check ASLR: Couldn't get personality")
+            pass
 
+    # Just go with whatever GDB says it did.
+    #
+    # This should usually be identical to the above, but we may not have
+    # access to procfs.
     output = gdb.execute('show disable-randomization', to_string=True)
     if "is off." in output:
         vmmap.aslr = True
 
     return vmmap.aslr
 
+@pwndbg.events.cont
+def mark_pc_as_executable():
+    mapping = find(pwndbg.regs.pc)
+    if mapping and not mapping.execute:
+        mapping.flags |= os.X_OK

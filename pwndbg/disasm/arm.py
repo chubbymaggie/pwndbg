@@ -1,16 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import collections
+
+from capstone import *
+from capstone.arm import *
 
 import pwndbg.arch
 import pwndbg.disasm.arch
 import pwndbg.memory
 import pwndbg.regs
-
-from capstone import *
-from capstone.arm import *
-
-import pwndbg.disasm.arch
 
 
 class DisassemblyAssistant(pwndbg.disasm.arch.DisassemblyAssistant):
@@ -70,4 +73,3 @@ class DisassemblyAssistant(pwndbg.disasm.arch.DisassemblyAssistant):
         return cc
 
 assistant = DisassemblyAssistant('arm')
-

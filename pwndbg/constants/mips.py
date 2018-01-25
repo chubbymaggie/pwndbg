@@ -1,4 +1,12 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 from .constant import Constant
+
 __NR_Linux = Constant('__NR_Linux',4000)
 __NR_syscall = Constant('__NR_syscall',(4000 +   0))
 __NR_exit = Constant('__NR_exit',(4000 +   1))

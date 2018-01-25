@@ -3,15 +3,23 @@
 """
 Compatibility functionality for Windbg users.
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
+import argparse
 import codecs
-import sys
 import math
+import sys
 
 import gdb
+
 import pwndbg.arch
 import pwndbg.commands
 import pwndbg.memory
 import pwndbg.strings
+import pwndbg.symbol
 import pwndbg.typeinfo
 
 
@@ -71,6 +79,7 @@ def dX(size, address, count, to_string=False):
     values = []
     address = int(address) & pwndbg.arch.ptrmask
     type   = get_type(size)
+    count = int(count)
     for i in range(count):
         try:
             gval = pwndbg.memory.poi(type, address + i * size)
@@ -160,17 +169,32 @@ def eX(size, address, data, hex=True):
     """
     address = pwndbg.commands.fix(address)
 
+    if address is None:
+        return
+
     for i,bytestr in enumerate(data):
         if hex:
             bytestr = bytestr.rjust(size*2, '0')
             data    = codecs.decode(bytestr, 'hex')
         else:
             data    = bytestr
+
+        if pwndbg.arch.endian == 'little':
+            data = data[::-1]
+
         pwndbg.memory.write(address + (i * size), data)
 
 @pwndbg.commands.ParsedCommand
 @pwndbg.commands.OnlyWhenRunning
 def dds(*a):
+    """
+    Dump pointers and symbols at the specified address.
+    """
+    return pwndbg.commands.telescope.telescope(*a)
+
+@pwndbg.commands.ParsedCommand
+@pwndbg.commands.OnlyWhenRunning
+def kd(*a):
     """
     Dump pointers and symbols at the specified address.
     """
@@ -193,16 +217,31 @@ def dqs(*a):
     return pwndbg.commands.telescope.telescope(*a)
 
 
-@pwndbg.commands.ParsedCommand
+da_parser = argparse.ArgumentParser()
+da_parser.description = 'Dump a string at the specified address.'
+da_parser.add_argument('address', help='Address to dump')
+da_parser.add_argument('max', type=int, nargs='?', default=256,
+                       help='Maximum string length')
+@pwndbg.commands.ArgparsedCommand(da_parser)
 @pwndbg.commands.OnlyWhenRunning
-def da(address, max=256):
-    """
-    Dump a string at the specified address.
-    """
+def da(address, max):
+    address = int(address)
+    address &= pwndbg.arch.ptrmask
+    print("%x" % address, repr(pwndbg.strings.get(address, max)))
+
+ds_parser = argparse.ArgumentParser()
+ds_parser.description = 'Dump a string at the specified address.'
+ds_parser.add_argument('address', help='Address to dump')
+ds_parser.add_argument('max', type=int, nargs='?', default=256,
+                       help='Maximum string length')
+@pwndbg.commands.ArgparsedCommand(ds_parser)
+@pwndbg.commands.OnlyWhenRunning
+def ds(address, max):
+    address = int(address)
+    address &= pwndbg.arch.ptrmask
     print("%x" % address, repr(pwndbg.strings.get(address, max)))
 
 @pwndbg.commands.ParsedCommand
-@pwndbg.commands.OnlyWhenRunning
 def bl():
     """
     List breakpoints
@@ -210,7 +249,6 @@ def bl():
     gdb.execute('info breakpoints')
 
 @pwndbg.commands.Command
-@pwndbg.commands.OnlyWhenRunning
 def bd(which = '*'):
     """
     Disable the breapoint with the specified index.
@@ -222,7 +260,6 @@ def bd(which = '*'):
 
 
 @pwndbg.commands.Command
-@pwndbg.commands.OnlyWhenRunning
 def be(which = '*'):
     """
     Enable the breapoint with the specified index.
@@ -233,7 +270,6 @@ def be(which = '*'):
         gdb.execute('enable breakpoints %s' % which)
 
 @pwndbg.commands.Command
-@pwndbg.commands.OnlyWhenRunning
 def bc(which = '*'):
     """
     Clear the breapoint with the specified index.
@@ -245,12 +281,13 @@ def bc(which = '*'):
 
 
 @pwndbg.commands.ParsedCommand
-@pwndbg.commands.OnlyWhenRunning
 def bp(where):
     """
-    Set a breakpoint
+    Set a breakpoint at the specified address.
     """
-    gdb.execute('break *%#x' % int(where))
+    result = pwndbg.commands.fix(where)
+    if result is not None:
+        gdb.execute('break *%#x' % int(result))
 
 @pwndbg.commands.ParsedCommand
 @pwndbg.commands.OnlyWhenRunning
@@ -261,10 +298,69 @@ def u(where=None, n=5):
     """
     if where is None:
         where = pwndbg.regs.pc
-    cmd = 'x/%ii %#x' % (int(n), int(where))
-    gdb.execute(cmd)
+    pwndbg.commands.nearpc.nearpc(where, n)
 
 @pwndbg.commands.Command
 @pwndbg.commands.OnlyWhenRunning
 def k():
+    """
+    Print a backtrace (alias 'bt')
+    """
     gdb.execute('bt')
+
+@pwndbg.commands.ParsedCommand
+@pwndbg.commands.OnlyWhenRunning
+def ln(value=None):
+    """
+    List the symbols nearest to the provided value.
+    """
+    if value is None: value = pwndbg.regs.pc
+    x = pwndbg.symbol.get(value)
+    if x:
+        result = '(%#x)   %s' % (value, x)
+
+@pwndbg.commands.QuietSloppyParsedCommand
+@pwndbg.commands.OnlyWhenRunning
+def lm(map):
+    """
+    Windbg compatibility alias for 'vmmap' command.
+    """
+    return pwndbg.commands.vmmap.vmmap(map)
+
+@pwndbg.commands.QuietSloppyParsedCommand
+@pwndbg.commands.OnlyWhenRunning
+def address(map):
+    """
+    Windbg compatibility alias for 'vmmap' command.
+    """
+    return pwndbg.commands.vmmap.vmmap(map)
+
+
+@pwndbg.commands.QuietSloppyParsedCommand
+@pwndbg.commands.OnlyWhenRunning
+def vprot(map):
+    """
+    Windbg compatibility alias for 'vmmap' command.
+    """
+    return pwndbg.commands.vmmap.vmmap(map)
+
+@pwndbg.commands.Command
+@pwndbg.commands.OnlyWhenRunning
+def peb(*a):
+    print("This isn't Windows!")
+
+@pwndbg.commands.Command
+@pwndbg.commands.OnlyWhenRunning
+def go():
+    '''
+    Windbg compatibility alias for 'continue' command.
+    '''
+    gdb.execute('continue')
+
+@pwndbg.commands.Command
+@pwndbg.commands.OnlyWhenRunning
+def pc():
+    '''
+    Windbg compatibility alias for 'nextcall' command.
+    '''
+    return pwndbg.commands.next.nextcall()

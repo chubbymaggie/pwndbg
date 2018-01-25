@@ -1,16 +1,27 @@
-try:
-    from __builtins__ import reload as _reload
-except:
-    from imp import reload as _reload
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import imp
 import os
 import sys
 import types
 
 import gdb
+
 import pwndbg
 import pwndbg.commands
 import pwndbg.events
+import pwndbg.memoize
+
+try:
+    from __builtins__ import reload as _reload
+except:
+    from imp import reload as _reload
+
 
 
 def rreload(module, mdict=None):
@@ -36,4 +47,12 @@ def rreload(module, mdict=None):
 def reload(*a):
     pwndbg.events.on_reload()
     rreload(pwndbg)
+    pwndbg.events.after_reload()
+
+@pwndbg.commands.Command
+def reinit_pwndbg():
+    """
+    Makes pwndbg reinitialize all state.
+    """
+    pwndbg.memoize.reset()
     pwndbg.events.after_reload()

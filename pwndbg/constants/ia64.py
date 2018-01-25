@@ -1,4 +1,12 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 from .constant import Constant
+
 __NR_ni_syscall = Constant('__NR_ni_syscall',1024)
 __NR_exit = Constant('__NR_exit',1025)
 __NR_read = Constant('__NR_read',1026)

@@ -4,6 +4,11 @@
 Common types, and routines for manually loading types from file
 via GCC.
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import glob
 import os
 import subprocess
@@ -11,11 +16,13 @@ import sys
 import tempfile
 
 import gdb
+
 import pwndbg.events
 import pwndbg.gcc
 import pwndbg.memoize
 
 module = sys.modules[__name__]
+
 
 def is_pointer(value):
     type = value
@@ -26,25 +33,39 @@ def is_pointer(value):
     type = type.strip_typedefs()
     return type.code == gdb.TYPE_CODE_PTR
 
-@pwndbg.events.new_objfile
-@pwndbg.memoize.reset_on_exit
+
+def lookup_types(*types):
+    for type_str in types:
+        try:
+            return gdb.lookup_type(type_str)
+        except Exception as e:
+            exc = e
+    raise exc
+
+
+@pwndbg.events.start
+@pwndbg.events.stop
 def update():
+
     module.char   = gdb.lookup_type('char')
-    module.ulong  = gdb.lookup_type('unsigned long')
-    module.long   = gdb.lookup_type('long')
-    module.uchar  = gdb.lookup_type('unsigned char')
-    module.ushort = gdb.lookup_type('unsigned short')
-    module.uint   = gdb.lookup_type('unsigned int')
+    module.ulong  = lookup_types('unsigned long', 'uint')
+    module.long   = lookup_types('long', 'int')
+    module.uchar  = lookup_types('unsigned char', 'ubyte')
+    module.ushort = lookup_types('unsigned short', 'ushort')
+    module.uint   = lookup_types('unsigned int', 'uint')
     module.void   = gdb.lookup_type('void')
-    module.uint8  = gdb.lookup_type('unsigned char')
-    module.uint16 = gdb.lookup_type('unsigned short')
-    module.uint32 = gdb.lookup_type('unsigned int')
-    module.uint64 = gdb.lookup_type('unsigned long long')
+    module.uint8  = module.uchar
+    module.uint16 = module.ushort
+    module.uint32 = module.uint
+    module.uint64 = lookup_types('unsigned long long', 'ulong')
 
     module.int8   = gdb.lookup_type('char')
     module.int16  = gdb.lookup_type('short')
     module.int32  = gdb.lookup_type('int')
-    module.int64  = gdb.lookup_type('long long')
+    module.int64  = lookup_types('long long', 'long')
+
+    module.ssize_t = module.long
+    module.size_t = module.ulong
 
     module.pvoid  = void.pointer()
     module.ppvoid = pvoid.pointer()
@@ -55,13 +76,10 @@ def update():
     if pvoid.sizeof == 4: module.ptrdiff = uint32
     if pvoid.sizeof == 8: module.ptrdiff = uint64
 
+    module.null = gdb.Value(0).cast(void)
 
 # Call it once so we load all of the types
 update()
-
-# Reset the cache so that the first load isn't cached.
-update.clear()
-
 
 tempdir = tempfile.gettempdir() + '/pwndbg'
 if not os.path.exists(tempdir):
@@ -80,6 +98,7 @@ blacklist = ['regexp.h', 'xf86drm.h', 'libxl_json.h', 'xf86drmMode.h',
 'libunwind.h','libmjollnir-objects.h','libunwind-coredump.h','libunwind-dynamic.h']
 
 def load(name):
+    """Load symbol by name from headers in standard system include directory"""
     try:
         return gdb.lookup_type(name)
     except gdb.error:
@@ -112,18 +131,42 @@ def load(name):
 {name} foo;
 '''.format(**locals())
 
-    filename = '%s/%s_%s' % (tempdir, arch, '-'.join(name.split()))
+    filename = '%s/%s_%s.cc' % (tempdir, arch, '-'.join(name.split()))
 
-    if not os.path.exists(filename + '.o'):
-        with open(filename + '.cc', 'w+') as f:
-            f.write(source)
-            f.flush()
+    with open(filename, 'w+') as f:
+        f.write(source)
+        f.flush()
+        os.fsync(f.fileno())
 
-        gcc     = pwndbg.gcc.which()
-        gcc    += ['-w','-c','-g',filename + '.cc','-o',filename + '.o']
-        subprocess.check_output(' '.join(gcc), shell=True)
-
-    with pwndbg.events.Pause():
-        gdb.execute('add-symbol-file %s.o 0' % filename, from_tty=False, to_string=True)
+    compile(filename)
 
     return gdb.lookup_type(name)
+
+def compile(filename=None, address=0):
+    """Compile and extract symbols from specified file"""
+    if filename is None:
+        print("Specify a filename to compile.")
+        return
+
+    objectname = os.path.splitext(filename)[0] + ".o"
+
+    if not os.path.exists(objectname):
+        gcc     = pwndbg.gcc.which()
+        gcc    += ['-w', '-c', '-g', filename, '-o', objectname]
+        subprocess.check_output(' '.join(gcc), shell=True)
+
+    add_symbol_file(objectname, address)
+
+def add_symbol_file(filename=None, address=0):
+    """Read additional symbol table information from the object file filename"""
+    if filename is None:
+        print("Specify a symbol file to add.")
+        return
+
+    with pwndbg.events.Pause():
+        gdb.execute('add-symbol-file %s %s' % (filename, address), from_tty=False, to_string=True)
+
+def read_gdbvalue(type_name, addr):
+    """ Read the memory contents at addr and interpret them as a GDB value with the given type """
+    gdb_type = pwndbg.typeinfo.load(type_name)
+    return gdb.Value(addr).cast(gdb_type.pointer()).dereference()

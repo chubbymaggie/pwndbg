@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 # import pwndbg.arch
 # import pwndbg.jump.mips
 # import pwndbg.jump.arm
@@ -15,4 +17,3 @@
 #     @property
 #     def foobar(self):
 #         return self._foobar
-

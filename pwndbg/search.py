@@ -1,45 +1,69 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Search the address space for byte patterns or pointer values.
+Search the address space for byte patterns.
 """
-import struct
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
 
 import gdb
+
 import pwndbg.arch
 import pwndbg.memory
 import pwndbg.typeinfo
 import pwndbg.vmmap
 
 
-def search(searchfor):
-    value = searchfor
-    size  = None
+def search(searchfor, mappings=None, start=None, end=None, 
+           executable=False, writable=False):
+    """Search inferior memory for a byte sequence.
 
-    if searchfor.isdigit():
-        searchfor = int(searchfor)
-    elif all(c in 'xABCDEFabcdef0123456789' for c in searchfor):
-        searchfor = int(searchfor, 16)
+    Arguments:
+        searchfor(bytes): Byte sequence to find
+        mappings(list): List of pwndbg.memory.Page objects to search
+            By default, uses all available mappings.
+        start(int): First address to search, inclusive.
+        end(int): Last address to search, exclusive.
+        executable(bool): Restrict search to executable pages
+        writable(bool): Restrict search to writable pages
 
-    if isinstance(searchfor, (long, int)):
-        if pwndbg.arch.ptrsize == 4:
-            searchfor = struct.pack('I', searchfor)
-        elif pwndbg.arch.ptrsize == 8:
-            searchfor = struct.pack('L', searchfor)
-
+    Yields:
+        An iterator on the address matches
+    """
     i = gdb.selected_inferior()
 
-    maps = pwndbg.vmmap.get()
-    hits = []
+    maps = mappings or pwndbg.vmmap.get()
+    
+    if end and start:
+        assert start < end, 'Last address to search must be greater then first address'
+        maps = [m for m in maps if start in m or (end-1) in m]
+    elif start:
+        maps = [m for m in maps if start in m]
+    elif end:
+        maps = [m for m in maps if (end-1) in m]
+
+    if executable:
+        maps = [m for m in maps if m.execute]
+
+    if writable:
+        maps = [m for m in maps if m.write]
+
     for vmmap in maps:
-        start = vmmap.vaddr
-        end   = start + vmmap.memsz
+        start = vmmap.start
+        end   = vmmap.end
+
         while True:
             # No point in searching if we can't read the memory
             if not pwndbg.memory.peek(start):
                 break
 
-            start = i.search_memory(start, end - start, searchfor)
+            length = end - start
+            if length <= 0:
+                break
+
+            start = i.search_memory(start, length, searchfor)
 
             if start is None:
                 break

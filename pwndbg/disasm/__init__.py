@@ -4,39 +4,52 @@
 Functionality for disassmebling code at an address, or at an
 address +/- a few instructions.
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import collections
 
+import capstone
 import gdb
+from capstone import *
+
 import pwndbg.arch
 import pwndbg.disasm.arch
 import pwndbg.ida
+import pwndbg.jump
+import pwndbg.memoize
 import pwndbg.memory
 import pwndbg.symbol
-import pwndbg.memoize
-import pwndbg.jump
 
-import capstone
-from capstone import *
-
-
-Instruction = collections.namedtuple('Instruction', ['address', 'length', 'asm', 'target'])
+try:
+    import pwndbg.emu.emulator
+except:
+    pwndbg.emu = None
 
 disassembler = None
 last_arch    = None
 
-
 CapstoneArch = {
-    'arm':     Cs(CS_ARCH_ARM, CS_MODE_ARM),
-    'aarch64': Cs(CS_ARCH_ARM64, CS_MODE_ARM),
-    'i386':    Cs(CS_ARCH_X86, CS_MODE_32),
-    'x86-64':  Cs(CS_ARCH_X86, CS_MODE_64),
-    'powerpc': Cs(CS_ARCH_PPC, CS_MODE_32),
-    'mips':    Cs(CS_ARCH_MIPS, CS_MODE_32),
-    'sparc':   Cs(CS_ARCH_SPARC, 0),
+    'arm': CS_ARCH_ARM,
+    'aarch64': CS_ARCH_ARM64,
+    'i386': CS_ARCH_X86,
+    'x86-64': CS_ARCH_X86,
+    'powerpc': CS_ARCH_PPC,
+    'mips': CS_ARCH_MIPS,
+    'sparc': CS_ARCH_SPARC,
 }
 
-for cs in CapstoneArch.values():
-    cs.detail = True
+CapstoneEndian = {
+    'little': CS_MODE_LITTLE_ENDIAN,
+    'big': CS_MODE_BIG_ENDIAN,
+}
+
+CapstoneMode = {
+    4: CS_MODE_32,
+    8: CS_MODE_64
+}
 
 # For variable-instruction-width architectures
 # (x86 and amd64), we keep a cache of instruction
@@ -46,18 +59,37 @@ for cs in CapstoneArch.values():
 VariableInstructionSizeMax = {
     'i386':   16,
     'x86-64': 16,
+    'mips':   8,
 }
 
-backward_cache = collections.defaultdict(lambda: 0)
+backward_cache = collections.defaultdict(lambda: None)
+
+@pwndbg.memoize.reset_on_objfile
+def get_disassembler_cached(arch, ptrsize, endian, extra=None):
+    arch = CapstoneArch[arch]
+
+    if extra is None:
+        mode = CapstoneMode[ptrsize]
+    else:
+        mode = extra
+
+    mode |= CapstoneEndian[endian]
+
+    cs = Cs(arch, mode)
+    cs.detail = True
+    return cs
 
 def get_disassembler(pc):
-    arch = pwndbg.arch.current
-    d    = CapstoneArch[arch]
-    if arch in ('arm', 'aarch64'):
-        d.mode = {0:CS_MODE_ARM,0x20:CS_MODE_THUMB}[pwndbg.regs.cpsr & 0x20]
-    else:
-        d.mode = {4:CS_MODE_32, 8:CS_MODE_64}[pwndbg.arch.ptrsize]
-    return d
+    extra = None
+
+    if pwndbg.arch.current in ('arm', 'aarch64'):
+        extra = {0:CS_MODE_ARM,
+                 0x20:CS_MODE_THUMB}[pwndbg.regs.cpsr & 0x20]
+
+    return get_disassembler_cached(pwndbg.arch.current,
+                                   pwndbg.arch.ptrsize,
+                                   pwndbg.arch.endian,
+                                   extra)
 
 @pwndbg.memoize.reset_on_cont
 def get_one_instruction(address):
@@ -69,10 +101,10 @@ def get_one_instruction(address):
         return ins
 
 def one(address=None):
-    if address == 0:
-        return None
     if address is None:
         address = pwndbg.regs.pc
+    if not pwndbg.memory.peek(address):
+        return None
     for insn in get(address, 1):
         backward_cache[insn.next] = insn.address
         return insn
@@ -101,32 +133,119 @@ def get(address, instructions=1):
 
     return retval
 
-def near(address, instructions=1):
+
+# These instruction types should not be emulated through, either
+# because they cannot be emulated without interfering (syscall, etc.)
+# or because they may take a long time (call, etc.), or because they
+# change privilege levels.
+DO_NOT_EMULATE = {
+    capstone.CS_GRP_CALL,
+    capstone.CS_GRP_INT,
+    capstone.CS_GRP_INVALID,
+    capstone.CS_GRP_IRET,
+
+# Note that we explicitly do not include the PRIVILEGE category, since
+# we may be in kernel code, and privileged instructions are just fine
+# in that case.
+#    capstone.CS_GRP_PRIVILEGE,
+}
+
+def near(address, instructions=1, emulate=False, show_prev_insns=True):
+    """
+    Disasms instructions near given `address`. Passing `emulate` makes use of
+    unicorn engine to emulate instructions to predict branches that will be taken.
+    `show_prev_insns` makes this show previously cached instructions
+    (this is mostly used by context's disasm display, so user see what was previously)
+    """
+
     current = one(address)
 
-    if not current:
+    pc = pwndbg.regs.pc
+
+    if current is None or not pwndbg.memory.peek(address):
         return []
+
+    insns  = []
 
     # Try to go backward by seeing which instructions we've returned
     # before, which were followed by this one.
-    needle = address
-    insns  = []
-    insn   = one(backward_cache[current.address])
-    while insn and len(insns) < instructions:
-        insns.append(insn)
-        insn = one(backward_cache[insn.address])
-    insns.reverse()
+    if show_prev_insns:
+        cached = backward_cache[current.address]
+        insn   = one(cached) if cached else None
+        while insn is not None and len(insns) < instructions:
+            insns.append(insn)
+            cached = backward_cache[insn.address]
+            insn = one(cached) if cached else None
+        insns.reverse()
+
     insns.append(current)
 
-    # Now find all of the instructions moving forward.
-    insn  = current
-    while insn and len(insns) < 1+(2*instructions):
-        # In order to avoid annoying cycles where the current instruction
-        # is a branch, which evaluates to true, and jumps back a short
-        # number of instructions.
+    # Some architecture aren't emulated yet
+    if not pwndbg.emu or pwndbg.arch.current not in pwndbg.emu.emulator.arch_to_UC:
+        emulate = False
 
-        insn = one(insn.next)
+    # Emulate forward if we are at the current instruction.
+    emu = None
+
+    # If we hit the current instruction, we can do emulation going forward from there.
+    if address == pc and emulate:
+        emu = pwndbg.emu.emulator.Emulator()
+
+        # For whatever reason, the first instruction is emulated twice.
+        # Skip the first one here.
+        emu.single_step()
+
+    # Now find all of the instructions moving forward.
+    #
+    # At this point, we've already added everything *BEFORE* the requested address,
+    # and the instruction at 'address'.
+    insn  = current
+    total_instructions = 1+(2*instructions)
+
+    while insn and len(insns) < total_instructions:
+        target = insn.target
+
+        # Disable emulation if necessary
+        if emulate and set(insn.groups) & DO_NOT_EMULATE:
+            emulate = False
+            emu     = None
+
+        # Continue disassembling after a RET or JUMP, but don't follow through CALL.
+        if capstone.CS_GRP_CALL in insn.groups:
+            target = insn.next
+
+        # If we initialized the emulator and emulation is still enabled, we can use it
+        # to figure out the next instruction.
+        elif emu:
+            target_candidate, size_candidate = emu.single_step()
+
+            if None not in (target_candidate, size_candidate):
+                target = target_candidate
+                size   = size_candidate
+
+        # Continue disassembling at the *next* instruction unless we have emulated
+        # the path of execution.
+        elif target != pc:
+            target = insn.next
+
+
+        insn = one(target)
         if insn:
             insns.append(insn)
 
+    # Remove repeated instructions at the end of disassembly.
+    # Always ensure we display the current and *next* instruction,
+    # but any repeats after that are removed.
+    #
+    # This helps with infinite loops and RET sleds.
+    while insns and len(insns) > 2 and len(set(insns[-3:])) == 1:
+        del insns[-1]
+
     return insns
+
+
+def is_call(address=None):
+    """
+    Returns whether a given address contains call instruction.
+    """
+    return capstone.CS_GRP_CALL in one(address).groups

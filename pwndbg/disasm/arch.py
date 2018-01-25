@@ -1,8 +1,19 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
+import collections
+
+import capstone
+from capstone import *
+
 import pwndbg.memoize
 import pwndbg.symbol
-import capstone
-import collections
-from capstone import *
+
+CS_OP_IMM
 
 debug = False
 
@@ -91,16 +102,33 @@ class DisassemblyAssistant(object):
         if instruction.condition in (True, None):
             next_addr = self.next(instruction)
 
+        instruction.target = None
+        instruction.target_const = None
+        instruction.next = None
+
         if next_addr is None:
             next_addr = instruction.address + instruction.size
+            instruction.target = self.next(instruction, call=True)
+
 
         instruction.next = next_addr & pwndbg.arch.ptrmask
 
-    def next(self, instruction):
+        if instruction.target is None:
+            instruction.target = instruction.next
+
+        if instruction.operands and instruction.operands[0].int:
+            instruction.target_const = True
+
+
+    def next(self, instruction, call=False):
         """
         Architecture-specific hook point for enhance_next.
         """
-        if CS_GRP_JUMP not in instruction.groups:
+        if CS_GRP_CALL in instruction.groups:
+            if not call:
+                return None
+
+        elif CS_GRP_JUMP not in instruction.groups:
             return None
 
         # At this point, all operands have been resolved.
@@ -109,11 +137,25 @@ class DisassemblyAssistant(object):
             return None
 
         # Memory operands must be dereferenced
-        addr = instruction.operands[0].int
-        if instruction.operands[0].type == CS_OP_MEM:
-            addr = int(pwndbg.memory.poi(pwndbg.typeinfo.ppvoid, addr))
+        op   = instruction.operands[0]
+        addr = op.int
+        if addr:
+            addr &= pwndbg.arch.ptrmask
+        if op.type == CS_OP_MEM:
+            if addr is None:
+                addr = self.memory(instruction, op)
 
-        return addr
+            # self.memory may return none, so we need to check it here again
+            if addr is not None:
+                addr = int(pwndbg.memory.poi(pwndbg.typeinfo.ppvoid, addr))
+        if op.type == CS_OP_REG:
+            addr = self.register(instruction, op)
+
+        # Evidently this can happen?
+        if addr is None:
+            return None
+
+        return int(addr)
 
     def enhance_symbol(self, instruction):
         """
@@ -158,6 +200,8 @@ class DisassemblyAssistant(object):
             op.symbol = None
 
             op.int = self.op_handlers.get(op.type, lambda *a: None)(instruction, op)
+            if op.int:
+                op.int &= pwndbg.arch.ptrmask
             op.str = self.op_names.get(op.type, lambda *a: None)(instruction, op)
 
             if op.int:

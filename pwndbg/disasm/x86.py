@@ -1,14 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import collections
+
+from capstone import *
+from capstone.x86 import *
 
 import pwndbg.arch
 import pwndbg.memory
 import pwndbg.regs
 import pwndbg.typeinfo
-
-from capstone import *
-from capstone.x86 import *
 
 groups = {v:k for k,v in globals().items() if k.startswith('X86_GRP_')}
 ops    = {v:k for k,v in globals().items() if k.startswith('X86_OP_')}
@@ -89,8 +94,9 @@ class DisassemblyAssistant(pwndbg.disasm.arch.DisassemblyAssistant):
                 sz += ' - '
             elif arith and op.mem.disp >= 0:
                 sz += ' + '
+            sz += '%#x' % abs(op.mem.disp)
 
-        sz += ']'
+        sz = '[%s]' % sz
         return sz
 
 
@@ -100,14 +106,14 @@ class DisassemblyAssistant(pwndbg.disasm.arch.DisassemblyAssistant):
 
         return instruction.address + instruction.size
 
-    def next(self, instruction):
+    def next(self, instruction, call=False):
         # Only enhance 'ret'
         if X86_INS_RET != instruction.id or len(instruction.operands) > 1:
-            return super(DisassemblyAssistant, self).next(instruction)
+            return super(DisassemblyAssistant, self).next(instruction, call)
 
         # Stop disassembling at RET if we won't know where it goes to
         if instruction.address != pwndbg.regs.pc:
-            return 0
+            return None
 
         # Otherwise, resolve the return on the stack
         pop = 0
@@ -116,7 +122,8 @@ class DisassemblyAssistant(pwndbg.disasm.arch.DisassemblyAssistant):
 
         address = (pwndbg.regs.sp) + (pwndbg.arch.ptrsize * pop)
 
-        return int(pwndbg.memory.poi(pwndbg.typeinfo.ppvoid, address))
+        if pwndbg.memory.peek(address):
+            return int(pwndbg.memory.poi(pwndbg.typeinfo.ppvoid, address))
 
 
 

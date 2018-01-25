@@ -1,11 +1,22 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import os
+import re
 import sys
 
 import gdb
+
+import pwndbg.abi
 import pwndbg.arch
 import pwndbg.events
 import pwndbg.info
 import pwndbg.memory
+import pwndbg.qemu
 import pwndbg.regs
 import pwndbg.stack
 import pwndbg.typeinfo
@@ -94,7 +105,7 @@ class AUXV(dict):
     def __str__(self):
         return str({k:v for k,v in self.items() if v is not None})
 
-@pwndbg.memoize.reset_on_start
+@pwndbg.memoize.reset_on_objfile
 def get():
     return use_info_auxv() or walk_stack() or AUXV()
 
@@ -106,14 +117,14 @@ def use_info_auxv():
 
     auxv = AUXV()
     for line in lines:
-        tokens = line.split()
-        const  = int(tokens[0])
+        match = re.match('([0-9]+) .* (0x[0-9a-f]+|[0-9]+)', line)
+        if not match:
+            print("Warning: Skipping auxv entry '{}'".format(line))
+            continue
 
-        # GDB will attempt to read strings for us, we dont want this
-        if '"' in tokens[-1]: tokens.pop(-1)
-
-        value = eval(tokens[-1])
+        const, value = int(match.group(1)), int(match.group(2), 0)
         auxv.set(const, value)
+
     return auxv
 
 
@@ -140,6 +151,11 @@ def find_stack_boundary(addr):
     return addr
 
 def walk_stack():
+    if not pwndbg.abi.linux:
+        return None
+    if pwndbg.qemu.is_qemu_kernel():
+        return None
+
     auxv = walk_stack2(0)
 
     if not auxv:
@@ -147,8 +163,11 @@ def walk_stack():
         # not aligned properly.
         auxv = walk_stack2(1)
 
-    if not auxv['AT_EXECFN']:
-        auxv['AT_EXECFN'] = get_execfn()
+    if not auxv.get('AT_EXECFN', None):
+        try:
+            auxv['AT_EXECFN'] = get_execfn()
+        except gdb.MemoryError:
+            pass
 
     return auxv
 
@@ -156,7 +175,7 @@ def walk_stack2(offset=0):
     sp  = pwndbg.regs.sp
 
     if not sp:
-        return None
+        return AUXV()
 
     #
     # Strategy looks like this:
@@ -203,7 +222,7 @@ def walk_stack2(offset=0):
             break
         p -= 2
     else:
-        return
+        return AUXV()
 
     # If we continue to p back, we should bump into the
     # very end of ENVP (and perhaps ARGV if ENVP is empty).
@@ -227,6 +246,10 @@ def walk_stack2(offset=0):
     return auxv
 
 def get_execfn():
+    # If the stack is not sane, this won't work
+    if not pwndbg.memory.peek(pwndbg.regs.sp):
+        return
+
     # QEMU does not put AT_EXECFN in the Auxiliary Vector
     # on the stack.
     #
@@ -246,4 +269,5 @@ def get_execfn():
         addr -= 1
 
     v = pwndbg.strings.get(addr, 1024)
-    return os.path.abspath(v)
+    if v:
+        return os.path.abspath(v)

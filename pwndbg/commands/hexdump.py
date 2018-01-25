@@ -1,36 +1,63 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
+import argparse
+
+import gdb
+
 import pwndbg.arch
 import pwndbg.commands
+import pwndbg.config
 import pwndbg.hexdump
 import pwndbg.memory
 import pwndbg.regs
 
+pwndbg.config.Parameter('hexdump-width',
+                         16,
+                         'line width of hexdump command')
+pwndbg.config.Parameter('hexdump-bytes',
+                         64,
+                         'number of bytes printed by hexdump command')
 
-@pwndbg.commands.ParsedCommand
+parser = argparse.ArgumentParser(description='Hexdumps data at the specified address (or at $sp)')
+parser.add_argument('address', nargs='?', default='$sp',
+                    help='Address to dump')
+parser.add_argument('count', nargs='?', default=pwndbg.config.hexdump_bytes,
+                    help='Number of bytes to dump')
+
+
+@pwndbg.commands.ArgparsedCommand(parser)
 @pwndbg.commands.OnlyWhenRunning
-def hexdump(address=None, count=64):
-    """
-    Hexdumps data at the specified address.
-    Optionally provide the number of bytes to dump (default 64)
+def hexdump(address=None, count=pwndbg.config.hexdump_bytes):
 
-    Note that repeating rows are collapsed.
-    """
-    address = int(address if address is not None else pwndbg.regs.sp)
+    if hexdump.repeat:
+        address = hexdump.last_address
+        hexdump.offset += 1
+    else:
+        hexdump.offset = 0
+
+    address = int(address)
     address &= pwndbg.arch.ptrmask
-    count   = int(count)
-
-    # if None not in (address, count):
-    #     address = int(address)
-    #     count   = int(count):
+    count   = max(int(count), 0)
+    width   = int(pwndbg.config.hexdump_width)
 
     if count > address > 0x10000:
         count -= address
 
-    # if address is None:
-    # 	address =
+    try:
+        data = pwndbg.memory.read(address, count, partial=True)
+        hexdump.last_address = (address + count)
+    except gdb.error as e:
+        print(e)
+        return
 
-    data = pwndbg.memory.read(address, count, partial=True)
-
-    for line in pwndbg.hexdump.hexdump(data, address=address):
+    for i, line in enumerate(pwndbg.hexdump.hexdump(data, address=address, width=width, offset=hexdump.offset)):
         print(line)
+    hexdump.offset += i
+
+hexdump.last_address = 0
+hexdump.offset = 0

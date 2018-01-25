@@ -3,31 +3,42 @@
 """
 Wrapper for shell commands.
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import os
 
 import gdb
+
 import pwndbg.commands
+import pwndbg.which
 
 shellcmds = [
+    "asm", # pwntools
     "awk",
     "bash",
     "cat",
     "chattr",
     "chmod",
     "chown",
-    "clear",
+    # "clear",
+    "constgrep", # pwntools
     "cp",
+    "cyclic", # pwntools
     "date",
     "diff",
+    "disasm", # pwntools
     "egrep",
-    "find",
+    # "find", don't expose find as its an internal gdb command
     "grep",
     "htop",
     "id",
     # "kill",
     # "killall",
     "less",
-    "ln",
+    # "ln",
     "ls",
     "man",
     "mkdir",
@@ -45,31 +56,32 @@ shellcmds = [
     "sed",
     "sh",
     "sort",
-    "sort",
     "ssh",
     "sudo",
     "tail",
     "top",
     "touch",
+    "unhex", # pwntools
     "uniq",
     "vi",
     "vim",
     "w",
-    "wc",
     "wget",
     "who",
     "whoami",
     "zsh",
 ]
 
-# def register_shell_function(cmd):
-#     def handler(*a):
-#         """Invokes %s""" % cmd
-#         if os.fork() == 0:
-#             os.execvp(cmd, (cmd,) + a)
-#         os.wait()
-#     handler.__name__ = cmd
-#     pwndbg.commands.Command(handler)
+shellcmds = filter(pwndbg.which.which, shellcmds)
 
-# for cmd in shellcmds:
-#     register_shell_function(cmd)
+def register_shell_function(cmd):
+    def handler(*a):
+        """Invokes %s""" % cmd
+        if os.fork() == 0:
+            os.execvp(cmd, (cmd,) + a)
+        os.wait()
+    handler.__name__ = str(cmd)
+    pwndbg.commands.Command(handler, False)
+
+for cmd in shellcmds:
+    register_shell_function(cmd)

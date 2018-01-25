@@ -1,5 +1,17 @@
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
+import functools
+import re
+
+import gdb
+
 import pwndbg.arch
+import pwndbg.color.message as M
+
 
 class ABI(object):
     """
@@ -36,6 +48,8 @@ class ABI(object):
         (32, 'arm', 'linux'):   linux_arm,
         (32, 'thumb', 'linux'):   linux_arm,
         (32, 'mips', 'linux'):   linux_mips,
+        (32, 'powerpc', 'linux'): linux_ppc,
+        (64, 'powerpc', 'linux'): linux_ppc64,
         }[(8*pwndbg.arch.ptrsize, pwndbg.arch.current, 'linux')]
 
     @staticmethod
@@ -47,6 +61,8 @@ class ABI(object):
         (32, 'arm', 'linux'):   linux_arm_syscall,
         (32, 'thumb', 'linux'):   linux_arm_syscall,
         (32, 'mips', 'linux'):   linux_mips_syscall,
+        (32, 'powerpc', 'linux'): linux_ppc_syscall,
+        (64, 'powerpc', 'linux'): linux_ppc64_syscall,
         }[(8*pwndbg.arch.ptrsize, pwndbg.arch.current, 'linux')]
 
     @staticmethod
@@ -82,12 +98,16 @@ linux_amd64  = ABI(['rdi','rsi','rdx','rcx','r8','r9'], 8, 0)
 linux_arm    = ABI(['r0', 'r1', 'r2', 'r3'], 8, 0)
 linux_aarch64 = ABI(['x0', 'x1', 'x2', 'x3'], 16, 0)
 linux_mips  = ABI(['$a0','$a1','$a2','$a3'], 4, 0)
+linux_ppc = ABI(['r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10'], 4, 0)
+linux_ppc64 = ABI(['r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10'], 8, 0)
 
 linux_i386_syscall = SyscallABI(['eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp'], 4, 0)
 linux_amd64_syscall = SyscallABI(['rax','rdi', 'rsi', 'rdx', 'r10', 'r8', 'r9'],   8, 0)
 linux_arm_syscall   = SyscallABI(['r7', 'r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6'], 4, 0)
 linux_aarch64_syscall   = SyscallABI(['x8', 'x0', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6'], 16, 0)
-linux_mips_syscall  = ABI(['$v0', '$a0','$a1','$a2','$a3'], 4, 0)
+linux_mips_syscall  = SyscallABI(['$v0', '$a0','$a1','$a2','$a3'], 4, 0)
+linux_ppc_syscall = ABI(['r0', 'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9'], 4, 0)
+linux_ppc64_syscall = ABI(['r0', 'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9'], 8, 0)
 
 linux_i386_sigreturn = SigreturnABI(['eax'], 4, 0)
 linux_amd64_sigreturn = SigreturnABI(['rax'], 4, 0)
@@ -97,3 +117,52 @@ linux_arm_sigreturn = SigreturnABI(['r7'], 4, 0)
 linux_i386_srop = ABI(['eax'], 4, 0)
 linux_amd64_srop = ABI(['rax'], 4, 0)
 linux_arm_srop = ABI(['r7'], 4, 0)
+
+
+@pwndbg.events.start
+def update():
+    global abi
+    global linux
+
+    # Detect current ABI of client side by 'show osabi'
+    osabi_string = gdb.execute('show osabi', to_string=True)
+
+    # The return string will be:
+    # The current OS ABI is "auto" (currently "GNU/Linux").
+    match = re.search('currently "([^"]+)"', osabi_string)
+    if match:
+        # 'GNU/Linux': linux
+        # 'none': bare metal
+        abi = match.group(1)
+
+        linux = 'Linux' in abi
+
+    if not linux:
+        msg = M.warn(
+            "The bare metal debugging is enabled since the gdb's osabi is '%s' which is not 'GNU/Linux'.\n"
+            "Ex. the page resolving and memory de-referencing ONLY works on known pages.\n"
+            "This option is based ib gdb client compile arguments (by default) and will be corrected if you load an ELF which has the '.note.ABI-tag' section.\n"
+            "If you are debuging a program that runs on Linux ABI, please select the correct gdb client."
+            % abi
+        )
+        print(msg)
+
+
+def LinuxOnly(default=None):
+    """Create a decorator that the function will be called when ABI is Linux.
+    Otherwise, return `default`.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def caller(*args, **kwargs):
+            if linux:
+                return func(*args, **kwargs)
+            else:
+                return default
+        return caller
+
+    return decorator
+
+
+# Update when starting the gdb to show warning message for non-Linux ABI user.
+update()

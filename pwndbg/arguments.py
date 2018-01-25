@@ -4,20 +4,28 @@
 Allows describing functions, specifically enumerating arguments which
 may be passed in a combination of registers and stack values.
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import gdb
+from capstone import CS_GRP_CALL
+from capstone import CS_GRP_INT
+
 import pwndbg.abi
 import pwndbg.arch
+import pwndbg.chain
+import pwndbg.color.nearpc as N
 import pwndbg.constants
 import pwndbg.disasm
-import pwndbg.functions
 import pwndbg.funcparser
+import pwndbg.functions
 import pwndbg.ida
 import pwndbg.memory
 import pwndbg.regs
 import pwndbg.symbol
 import pwndbg.typeinfo
-
-from capstone import CS_GRP_CALL, CS_GRP_INT
 
 ida_replacements = {
     '__int64': 'signed long long int',
@@ -46,8 +54,9 @@ ida_replacements = {
     '__userpurge': '',
 }
 
+
 def get_syscall_name(instruction):
-    if not CS_GRP_INT in instruction.groups:
+    if CS_GRP_INT not in instruction.groups:
         return None
 
     try:
@@ -58,6 +67,7 @@ def get_syscall_name(instruction):
         return 'SYS_' + name
     except:
         return None
+
 
 def get(instruction):
     """
@@ -71,7 +81,10 @@ def get(instruction):
     if instruction.address != pwndbg.regs.pc:
         return []
 
-    abi = pwndbg.abi.ABI.default()
+    try:
+        abi = pwndbg.abi.ABI.default()
+    except KeyError:
+        return []
 
     if CS_GRP_CALL in instruction.groups:
         # Not sure of any OS which allows multiple operands on
@@ -90,8 +103,8 @@ def get(instruction):
         # Get the syscall number and name
         abi = pwndbg.abi.ABI.syscall()
 
-        print(abi)
-        print(abi.register_arguments)
+        # print(abi)
+        # print(abi.register_arguments)
 
         target  = None
         syscall = getattr(pwndbg.regs, abi.syscall_register)
@@ -100,7 +113,7 @@ def get(instruction):
         return []
 
     result = []
-    args = []
+    name = name or ''
 
     sym   = gdb.lookup_symbol(name)
     name  = name.strip().lstrip('_')    # _malloc
@@ -118,7 +131,6 @@ def get(instruction):
         except TypeError:
             pass
 
-
     # Try to grab the data out of IDA
     if not func and target:
         typename = pwndbg.ida.GetType(target)
@@ -129,17 +141,17 @@ def get(instruction):
             # GetType() does not include the name.
             typename = typename.replace('(', ' function_name(', 1)
 
-            for k,v in ida_replacements.items():
-                typename = typename.replace(k,v)
+            for k, v in ida_replacements.items():
+                typename = typename.replace(k, v)
 
-            func     = pwndbg.funcparser.ExtractFuncDeclFromSource(typename + ';')
+            func = pwndbg.funcparser.ExtractFuncDeclFromSource(typename + ';')
 
     if func:
         args = func.args
     else:
-        args = [pwndbg.functions.Argument('int',0,argname(i, abi)) for i in range(n_args_default)]
+        args = [pwndbg.functions.Argument('int', 0, argname(i, abi)) for i in range(n_args_default)]
 
-    for i,arg in enumerate(args):
+    for i, arg in enumerate(args):
         result.append((arg, argument(i, abi)))
 
     return result
@@ -153,6 +165,7 @@ def argname(n, abi=None):
         return regs[n]
 
     return 'arg[%i]' % n
+
 
 def argument(n, abi=None):
     """
@@ -171,3 +184,22 @@ def argument(n, abi=None):
 
     return int(pwndbg.memory.poi(pwndbg.typeinfo.ppvoid, sp))
 
+
+def arguments(abi=None):
+    """
+    Yields (arg_name, arg_value) tuples for arguments from a given ABI.
+    """
+    abi  = abi or pwndbg.abi.ABI.default()
+    regs = abi.register_arguments
+
+    for i in range(len(regs)):
+        yield argname(i, abi), argument(i, abi)
+
+
+def format_args(instruction):
+    result = []
+    for arg, value in get(instruction):
+        code   = arg.type != 'char'
+        pretty = pwndbg.chain.format(value, code=code)
+        result.append('%-10s %s' % (N.argument(arg.name) + ':', pretty))
+    return result
